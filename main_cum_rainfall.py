@@ -3,11 +3,12 @@
 Main entry point for cumulative rainfall plotting.
 
 Examples:
-  poetry run python main.py
-  poetry run python main.py --save plot.png --no-show
-  poetry run python main.py --years 2020:2025
-  poetry run python main.py --years '[2020, 2024, 2025]'
-  poetry run python main.py --station GHCND:USW00014837
+  poetry run python main_cum_rainfall.py
+  poetry run python main_cum_rainfall.py --save rain_cum.png --no-show
+  poetry run python main_cum_rainfall.py --years 2020:2025
+  poetry run python main_cum_rainfall.py --years '[2020, 2024, 2025]'
+  poetry run python main_cum_rainfall.py --station GHCND:USW00014837
+  poetry run python main_cum_rainfall.py --start-day 182  # start at DOY 182 (~Jul 1)
 """
 from __future__ import annotations
 
@@ -72,9 +73,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--units", choices=["standard", "metric"], help="Units for NOAA API + axis label")
     parser.add_argument("--years", help="Years (e.g., '2020:2025', '2020,2024,2025', or '[2020, 2024, 2025]')")
     parser.add_argument("--end-date", help="Clip to this date (YYYY-MM-DD); default: today")
+    parser.add_argument("--start-day", type=int, default=1,
+                        help="Start plotting from this day-of-year (1..366). Default: 1 (Jan 1)")
     parser.add_argument("--save", help="Save figure to this path (png/pdf/svg, etc.)")
     parser.add_argument("--no-show", action="store_true", help="Do not display the plot window")
-
+    parser.add_argument("--verbose", action="store_true", help="Print additional diagnostics")
     args = parser.parse_args(argv)
 
     # Config & defaults
@@ -90,7 +93,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     years_cfg = _get_cfg("YEARS", range(2020, datetime.now().year + 1))
     years = _parse_years(args.years, years_cfg)
     end_date = _parse_date(args.end_date)
-
     latest_year = max(years)
 
     # Choose station (command-line overrides auto-pick)
@@ -116,25 +118,58 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"Using station (auto full-coverage): {station_id}")
 
-    print(f"Years: {years}  Units: {units}  End date: {end_date or date.today()}")
+    # Always print a concise run header
+    end_for_label = end_date or date.today()
+    end_doy = end_for_label.timetuple().tm_yday
+    print(
+        f"Years: {years}  Units: {units}  "
+        f"Window: DOY {args.start_day}..{end_doy} (ends {end_for_label.isoformat()})"
+    )
 
     # Fetch data
     try:
         df = fetch_precip_for_years(token, station_id, years, units)
     except Exception as e:
-        print(f"ERROR: Fetch failed: {e}", file=sys.stderr)
+        print("ERROR: Fetch failed. NOAA CDO may be rate-limiting or under maintenance.", file=sys.stderr)
+        print(f"Details: {e}", file=sys.stderr)
         return 4
 
     if df.empty:
         print("WARNING: No precipitation data returned for the requested years/station.")
         return 0
 
-    # Prepare cumulative
+    # Summary after fetch (always print concise summary)
+    total_rows = len(df)
+    rows_by_year = df.groupby("year").size().to_dict()
     try:
-        prep = prepare_cumulative(df, end_date=end_date)
+        min_d = df["date"].min().date()
+        max_d = df["date"].max().date()
+    except Exception:
+        min_d = max_d = None
+    print(f"Fetched {total_rows} rows | rows by year: {rows_by_year} | date range: {min_d} .. {max_d}")
+
+    if args.verbose:
+        doy_counts = df.groupby("year")["doy"].nunique().to_dict()
+        print(f"Unique DOY counts by year (reported days): {doy_counts}")
+        print("Head:\n", df.head(10))
+
+    # Prepare cumulative rainfall (respect start_day)
+    try:
+        prep = prepare_cumulative(df, end_date=end_date, start_day=args.start_day)
     except Exception as e:
         print(f"ERROR: Failed to prepare cumulative data: {e}", file=sys.stderr)
         return 5
+
+    if prep.empty:
+        print("WARNING: Nothing to plot (start_day is after end date or no data in window).")
+        return 0
+
+    # Summary after prepare (always print concise summary)
+    days_by_year = prep.groupby("year")["doy"].nunique().to_dict()
+    print(f"Prepared window days per year: {days_by_year}")
+
+    if args.verbose:
+        print("Prepared head:\n", prep.head(10))
 
     # Plot
     try:
@@ -153,10 +188,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.save:
         print(f"Saved figure to: {args.save}")
+    else:
+        print("Plot completed.")
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
